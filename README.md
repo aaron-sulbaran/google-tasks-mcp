@@ -1,5 +1,7 @@
 # Google Tasks MCP Server
 
+> **Personal fork notice (aaron-sulbaran).** This is a personal, self-hosted fork of [akutishevsky/google-tasks-mcp](https://github.com/akutishevsky/google-tasks-mcp), pinned at upstream commit `0676ac8` after a full source audit (2026-08-20). Changes from upstream: the Google Analytics tag was removed from the privacy policy page and the analytics hosts were dropped from all Content-Security-Policy headers, so this deployment serves zero third-party trackers and only ever talks to Google's OAuth and Tasks APIs. Upstream updates are not pulled automatically; any future merge gets reviewed by hand first.
+
 A Model Context Protocol (MCP) server that brings your Google Tasks into Claude and other MCP-compatible clients. Manage your tasks, task lists, and to-dos through natural conversation.
 
 **🔒 Privacy First**: This repository is public to demonstrate transparency. The code shows that **no personal information is logged or stored maliciously**. All sensitive data (tokens) is encrypted at rest and automatically redacted from logs. You can review the entire codebase to verify this commitment to privacy.
