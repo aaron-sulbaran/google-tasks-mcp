@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { Hono } from "hono";
-import { tokenStore } from "./token-store.ts";
+import { tokenStore, ACCESS_TTL_MS } from "./token-store.ts";
 import crypto from "node:crypto";
 import { openKv } from "@deno/kv";
 import { createLogger } from "../utils/logger.ts";
@@ -226,6 +226,40 @@ export function createOAuthRouter(config: OAuthConfig) {
     const codeVerifier = body.code_verifier as string;
     const redirectUri = body.redirect_uri as string;
 
+    if (grantType === "refresh_token") {
+      const presented = body.refresh_token as string;
+      const clientId = body.client_id as string | undefined;
+      if (!presented) {
+        return c.json({ error: "invalid_request", error_description: "refresh_token required" }, 400);
+      }
+
+      const record = await tokenStore.getRefreshToken(presented);
+      if (!record) {
+        logger.warn("Token refresh failed: unknown or expired refresh token");
+        return c.json({ error: "invalid_grant" }, 400);
+      }
+      if (record.clientId && clientId && record.clientId !== clientId) {
+        logger.warn("Token refresh failed: client_id mismatch");
+        return c.json({ error: "invalid_grant" }, 400);
+      }
+
+      // Rotate: the presented refresh token is spent, a fresh pair goes out.
+      const mcpToken = crypto.randomUUID();
+      const nextRefresh = crypto.randomUUID();
+      await tokenStore.storeTokens(mcpToken, record.tokenData);
+      await tokenStore.storeRefreshToken(nextRefresh, record.tokenData, record.clientId);
+      await tokenStore.deleteRefreshToken(presented);
+
+      logger.info("Token refresh completed successfully");
+
+      return c.json({
+        access_token: mcpToken,
+        refresh_token: nextRefresh,
+        token_type: "Bearer",
+        expires_in: ACCESS_TTL_MS / 1000,
+      });
+    }
+
     if (grantType !== "authorization_code") {
       logger.warn("Token exchange failed: unsupported grant type");
       return c.json({ error: "unsupported_grant_type" }, 400);
@@ -280,23 +314,25 @@ export function createOAuthRouter(config: OAuthConfig) {
       }
 
       const mcpToken = crypto.randomUUID();
-
-      await tokenStore.storeTokens(mcpToken, {
+      const refreshToken = crypto.randomUUID();
+      const googleTokens = {
         googleAccessToken: tokenData.access_token,
         googleRefreshToken: tokenData.refresh_token,
         expiresAt: Date.now() + tokenData.expires_in * 1000,
-      });
+      };
+
+      await tokenStore.storeTokens(mcpToken, googleTokens);
+      await tokenStore.storeRefreshToken(refreshToken, googleTokens, authCodeData.clientId);
 
       await oauthStore.deleteAuthCode(code);
 
       logger.info("Token exchange completed successfully");
 
-      const MCP_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
-
       return c.json({
         access_token: mcpToken,
+        refresh_token: refreshToken,
         token_type: "Bearer",
-        expires_in: MCP_TOKEN_TTL_SECONDS,
+        expires_in: ACCESS_TTL_MS / 1000,
       });
     } catch (error) {
       logger.error("Token exchange error", { error: String(error) });
