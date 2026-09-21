@@ -174,11 +174,13 @@ export function moveTask(
   taskListId: string,
   taskId: string,
   parent?: string,
-  previous?: string
+  previous?: string,
+  destinationTaskListId?: string
 ) {
   const params = new URLSearchParams();
   if (parent) params.append("parent", parent);
   if (previous) params.append("previous", previous);
+  if (destinationTaskListId) params.append("destinationTasklist", destinationTaskListId);
 
   const query = params.toString() ? `?${params.toString()}` : "";
   return makeGoogleRequest(mcpToken, `/lists/${taskListId}/tasks/${taskId}/move${query}`, {

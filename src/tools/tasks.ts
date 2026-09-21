@@ -385,10 +385,14 @@ export function registerTasksTools(server: any, mcpAccessToken: string) {
   server.registerTool(
     "move_task",
     {
-      description: "Moves the specified task to another position in the destination task list. This can be used to change a task's parent task or position among its sibling tasks.",
+      description: "Moves the specified task to another position in the destination task list. This can be used to change a task's parent task or position among its sibling tasks, or, with destinationTaskListId, to move it to a different list (recurring tasks cannot be moved between lists).",
       inputSchema: {
-        taskListId: z.string().describe("Task list identifier."),
+        taskListId: z.string().describe("Task list identifier the task is currently in."),
         taskId: z.string().describe("Task identifier."),
+        destinationTaskListId: z
+          .string()
+          .optional()
+          .describe("Destination task list identifier. If set, the task is moved from taskListId to this list."),
         parent: z
           .string()
           .optional()
@@ -400,10 +404,10 @@ export function registerTasksTools(server: any, mcpAccessToken: string) {
       },
     },
     async (args: any) => {
-      const { taskListId, taskId, parent, previous } = args;
+      const { taskListId, taskId, destinationTaskListId, parent, previous } = args;
       logger.info("Tool invoked: move_task");
       try {
-        const result = await moveTask(mcpAccessToken, taskListId, taskId, parent, previous);
+        const result = await moveTask(mcpAccessToken, taskListId, taskId, parent, previous, destinationTaskListId);
         const processedData = addReadableTimestamps(result);
 
         return {
