@@ -47,6 +47,30 @@ export async function handleMcpPost(c: Context) {
     }, 400);
   }
 
+  // Notifications and responses carry no id and produce no reply. Streamable
+  // HTTP says to acknowledge them with an empty 202; holding an SSE stream
+  // open instead stalls clients that wait for the body to end (Claude Code
+  // times out its connection on the notifications/initialized handshake).
+  if (!("id" in message) || !("method" in message)) {
+    const ackTransport = new HonoSSETransport();
+    ackTransport.attachStream({
+      writeSSE: async () => {},
+      close: () => {},
+    });
+    const ackServer = new McpServer(
+      { name: "google-tasks-mcp", version: "1.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    registerAllTools(ackServer, mcpToken);
+    try {
+      await ackServer.connect(ackTransport);
+      await ackTransport.handleIncomingMessage(message);
+    } catch {
+      logger.error("Failed to handle MCP notification via POST");
+    }
+    return c.body(null, 202);
+  }
+
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
