@@ -21,6 +21,15 @@ setOAuthConfig(oauthConfig);
 
 const app = createApp({ oauthConfig });
 
+// The current Deno Deploy (console.deno.com) no longer auto-serves a default
+// { fetch } export the way Deploy Classic did; the app must listen itself.
+// Node hosts and Classic-style runners still get the default export below.
+const deno = (globalThis as any).Deno;
+if (deno?.serve) {
+  const port = Number(process.env.PORT) || 8000;
+  deno.serve({ port }, app.fetch);
+}
+
 export default {
   fetch: app.fetch,
 };
