@@ -6,12 +6,30 @@ import { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 // session map and no timer, so nothing keeps the isolate awake after the reply.
 export class SingleResponseTransport implements Transport {
   onmessage?: (message: JSONRPCMessage) => void;
-  onerror?: (error: Error) => void;
   onclose?: () => void;
+  private sdkOnError?: (error: Error) => void;
   private resolveReply!: (message: JSONRPCMessage) => void;
-  readonly reply = new Promise<JSONRPCMessage>((resolve) => {
+  private rejectReply!: (error: Error) => void;
+  readonly reply = new Promise<JSONRPCMessage>((resolve, reject) => {
     this.resolveReply = resolve;
+    this.rejectReply = reject;
   });
+
+  constructor() {
+    this.reply.catch(() => {}); // notifications never await the reply
+  }
+
+  // The SDK reports protocol errors here. Route them to the reply so a POST
+  // always ends (no later reply can arrive once an error is reported).
+  set onerror(handler: ((error: Error) => void) | undefined) {
+    this.sdkOnError = handler;
+  }
+  get onerror(): (error: Error) => void {
+    return (error) => {
+      this.rejectReply(error);
+      this.sdkOnError?.(error);
+    };
+  }
 
   start(): Promise<void> {
     return Promise.resolve();
@@ -23,6 +41,7 @@ export class SingleResponseTransport implements Transport {
   }
 
   close(): Promise<void> {
+    this.rejectReply(new Error("Transport closed before a reply"));
     this.onclose?.();
     return Promise.resolve();
   }

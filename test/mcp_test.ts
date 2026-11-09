@@ -1,103 +1,173 @@
-// Run: ENCRYPTION_SECRET=<32+ chars> deno test --allow-env --allow-read --allow-ffi test/
-import { createApp } from "../src/server/app.ts";
-import { tokenStore } from "../src/auth/token-store.ts";
+// Run: ENCRYPTION_SECRET=<32+ chars> deno test --allow-env --allow-read --allow-ffi --deny-net test/
+// Timers are intercepted before the app is imported so startup is covered too.
+const armed: string[] = [];
+const realSetTimeout = globalThis.setTimeout;
+const realSetInterval = globalThis.setInterval;
+globalThis.setTimeout = ((...a: unknown[]) => (armed.push("timeout"), (realSetTimeout as any)(...a))) as any;
+globalThis.setInterval = ((...a: unknown[]) => (armed.push("interval"), (realSetInterval as any)(...a))) as any;
 
-const BEARER = { Authorization: "Bearer test-token" };
-const JSON_HEADERS = {
-  ...BEARER,
-  "Content-Type": "application/json",
-  Accept: "application/json, text/event-stream",
+const { createApp } = await import("../src/server/app.ts");
+const { tokenStore } = await import("../src/auth/token-store.ts");
+const { SingleResponseTransport } = await import("../src/transport/mcp-transport.ts");
+
+const future = Date.now() + 3_600_000;
+const users: Record<string, { googleAccessToken: string; googleRefreshToken: string; expiresAt: number }> = {
+  alice: { googleAccessToken: "g-alice", googleRefreshToken: "r", expiresAt: future },
+  bob: { googleAccessToken: "g-bob", googleRefreshToken: "r", expiresAt: future },
+  expired: { googleAccessToken: "g-old", googleRefreshToken: "r", expiresAt: 0 },
 };
-
-(tokenStore as any).isValid = () => Promise.resolve(true);
-(tokenStore as any).getTokens = () =>
-  Promise.resolve({
-    googleAccessToken: "fake",
-    googleRefreshToken: "fake",
-    expiresAt: Date.now() + 3_600_000,
-  });
+(tokenStore as any).getTokens = (t: string) => Promise.resolve(users[t] ?? null);
+(tokenStore as any).isValid = (t: string) => Promise.resolve(t in users && t !== "expired");
 
 const app = createApp({
   oauthConfig: { clientId: "x", clientSecret: "y", redirectUri: "http://localhost/cb" },
 });
+const STARTUP_TIMERS = armed.length;
 
-const post = (body: unknown, headers: Record<string, string> = JSON_HEADERS) =>
-  app.request("/mcp", { method: "POST", headers, body: JSON.stringify(body) });
+const H = (token: string, accept = "application/json, text/event-stream") => ({
+  Authorization: `Bearer ${token}`,
+  "Content-Type": "application/json",
+  Accept: accept,
+});
+const post = (body: unknown, token = "alice", accept?: string) =>
+  app.request("/mcp", {
+    method: "POST",
+    headers: H(token, accept),
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
 
 function assert(cond: boolean, msg: string) {
   if (!cond) throw new Error(msg);
 }
 
-Deno.test("GET /mcp answers 405 with Allow: POST", async () => {
-  const res = await app.request("/mcp", { method: "GET", headers: BEARER });
-  assert(res.status === 405, `status ${res.status}`);
-  assert(res.headers.get("allow") === "POST", "missing Allow header");
+// Fake Google: echoes which Google token made the call; optionally huge.
+function fakeGoogle(big = false) {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = ((_url: string, init: RequestInit) => {
+    const auth = (init?.headers as Record<string, string>)?.Authorization ?? "";
+    const title = big ? "x".repeat(2_000_000) : auth;
+    return Promise.resolve(new Response(JSON.stringify({ items: [{ id: "l1", title }] })));
+  }) as any;
+  return () => (globalThis.fetch = realFetch);
+}
+
+const call = (id: number, name = "list_task_lists") => ({
+  jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: {} },
 });
 
-Deno.test("initialize, tools/list and tools/call each return one JSON response", async () => {
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = () =>
-    Promise.resolve(new Response(JSON.stringify({ items: [{ id: "l1", title: "Fake" }] })));
+Deno.test("GET /mcp answers 405 with Allow: POST", async () => {
+  const res = await app.request("/mcp", { method: "GET", headers: H("alice") });
+  assert(res.status === 405 && res.headers.get("allow") === "POST", `status ${res.status}`);
+});
+
+Deno.test("invalid and expired bearers get 401", async () => {
+  for (const t of ["nobody", "expired"]) {
+    const res = await post(call(1), t);
+    assert(res.status === 401, `${t} gave ${res.status}`);
+    await res.text();
+  }
+});
+
+Deno.test("two users each reach only their own Google credentials", async () => {
+  const restore = fakeGoogle();
+  try {
+    for (const [token, google] of [["alice", "g-alice"], ["bob", "g-bob"]]) {
+      const res = await post(call(7), token);
+      const text = (await res.json()).result.content[0].text as string;
+      assert(text.includes(`Bearer ${google}`), `${token} did not use ${google}`);
+      const other = google === "g-alice" ? "g-bob" : "g-alice";
+      assert(!text.includes(other), `${token} saw ${other}`);
+    }
+  } finally {
+    restore();
+  }
+});
+
+Deno.test("initialize, initialized, tools/list, tools/call sequence", async () => {
+  const restore = fakeGoogle();
   try {
     const init = await post({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-03-26",
-        capabilities: {},
-        clientInfo: { name: "test", version: "0" },
-      },
+      jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "t", version: "0" } },
     });
-    assert(init.status === 200, `initialize ${init.status}`);
-    assert(init.headers.get("content-type") === "application/json", "initialize not JSON");
-    assert((await init.json()).result.serverInfo.name === "google-tasks-mcp", "bad initialize");
-
+    assert(init.headers.get("content-type") === "application/json", "init not JSON");
+    assert((await init.json()).result.serverInfo.name === "google-tasks-mcp", "bad init");
+    const ack = await post({ jsonrpc: "2.0", method: "notifications/initialized" });
+    assert(ack.status === 202, `ack ${ack.status}`);
     const list = await post({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-    assert(list.headers.get("content-type") === "application/json", "tools/list not JSON");
     assert((await list.json()).result.tools.length > 0, "no tools");
-
-    const call = await post({
-      jsonrpc: "2.0",
-      id: 3,
-      method: "tools/call",
-      params: { name: "list_task_lists", arguments: {} },
-    });
-    assert(call.headers.get("content-type") === "application/json", "tools/call not JSON");
-    const body = await call.json();
-    assert(body.id === 3 && body.result.content[0].text.includes("Fake"), "bad tools/call");
+    const res = await post(call(3));
+    const body = await res.json();
+    assert(body.id === 3 && body.result.content[0].text.includes("l1"), "bad call");
   } finally {
-    globalThis.fetch = realFetch;
+    restore();
+  }
+});
+
+Deno.test("Talos direct tools/call shape, parsed the way talos-tasks parses it", async () => {
+  const restore = fakeGoogle();
+  try {
+    const res = await post(call(1));
+    const txt = await res.text();
+    let data: string | null = null;
+    for (const line of txt.split("\n")) if (line.startsWith("data:")) data = line.slice(5).trim();
+    if (data === null && txt.trim().startsWith("{")) data = txt;
+    assert(!!data && !!JSON.parse(data).result.content[0].text, "talos parse failed");
+  } finally {
+    restore();
   }
 });
 
 Deno.test("SSE-only clients get a finite one-event body", async () => {
-  const res = await post(
-    { jsonrpc: "2.0", id: 4, method: "tools/list" },
-    { ...BEARER, "Content-Type": "application/json", Accept: "text/event-stream" },
-  );
+  const res = await post({ jsonrpc: "2.0", id: 4, method: "tools/list" }, "alice", "text/event-stream");
   assert(res.headers.get("content-type") === "text/event-stream", "not SSE");
-  const text = await res.text(); // resolves only if the body ends
-  assert(text.includes("data: {"), "no data line");
+  assert((await res.text()).includes("data: {"), "no data line");
 });
 
-Deno.test("notification gets 202", async () => {
-  const res = await post({ jsonrpc: "2.0", method: "notifications/initialized" });
-  assert(res.status === 202, `status ${res.status}`);
-});
-
-Deno.test("no timers are armed by a request", async () => {
-  const armed: string[] = [];
-  const realSetTimeout = globalThis.setTimeout;
-  const realSetInterval = globalThis.setInterval;
-  globalThis.setTimeout = ((...a: unknown[]) => (armed.push("timeout"), (realSetTimeout as any)(...a))) as any;
-  globalThis.setInterval = ((...a: unknown[]) => (armed.push("interval"), (realSetInterval as any)(...a))) as any;
+Deno.test("large tool result is delivered completely", async () => {
+  const restore = fakeGoogle(true);
   try {
-    await post({ jsonrpc: "2.0", id: 5, method: "tools/list" });
-    await post({ jsonrpc: "2.0", method: "notifications/initialized" });
+    const res = await post(call(9));
+    const body = JSON.parse(await res.text());
+    assert(body.result.content[0].text.length > 2_000_000, "truncated");
   } finally {
-    globalThis.setTimeout = realSetTimeout;
-    globalThis.setInterval = realSetInterval;
+    restore();
   }
+});
+
+Deno.test("malformed bodies get 400, never 500 or a hang", async () => {
+  for (const body of ["null", "42", '"str"', "{}", "not json", '{"jsonrpc":"1.0","id":1,"method":"x"}']) {
+    const res = await post(body);
+    const json = await res.json();
+    assert(res.status === 400, `${body} gave ${res.status}`);
+    assert(json.jsonrpc === "2.0" && typeof json.error.code === "number", `${body} no envelope`);
+  }
+});
+
+Deno.test("batch gets 400", async () => {
+  const res = await post([{ jsonrpc: "2.0", id: 1, method: "tools/list" }]);
+  assert(res.status === 400, `status ${res.status}`);
+  assert((await res.json()).error.code === -32600, "wrong code");
+});
+
+Deno.test("SDK onerror and close end the reply instead of hanging", async () => {
+  const a = new SingleResponseTransport();
+  a.onerror = () => {};
+  a.onerror(new Error("boom"));
+  let failed = false;
+  await a.reply.catch(() => (failed = true));
+  assert(failed, "onerror did not reject");
+
+  const b = new SingleResponseTransport();
+  await b.close();
+  failed = false;
+  await b.reply.catch(() => (failed = true));
+  assert(failed, "close did not reject");
+});
+
+Deno.test("no timers armed at startup or during requests", async () => {
+  await post({ jsonrpc: "2.0", id: 5, method: "tools/list" });
+  await post({ jsonrpc: "2.0", method: "notifications/initialized" });
+  assert(STARTUP_TIMERS === 0, `startup armed ${STARTUP_TIMERS}`);
   assert(armed.length === 0, `timers armed: ${armed.join(",")}`);
 });

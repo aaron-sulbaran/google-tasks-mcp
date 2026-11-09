@@ -14,7 +14,7 @@ Google Tasks MCP Server — an open-source Model Context Protocol server that le
 - **Run**: `deno task dev` (runs compiled `build/index.js`)
 - **Generate encryption secret**: `npm run generate-secret`
 
-Tests: `ENCRYPTION_SECRET=<32+ chars> deno test --allow-env --allow-read --allow-ffi test/` (fakes only, no network).
+Tests: `ENCRYPTION_SECRET=<32+ chars> deno test --allow-env --allow-read --allow-ffi --deny-net test/` (fakes only, no network).
 
 ## Architecture
 
