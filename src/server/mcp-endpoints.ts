@@ -1,6 +1,7 @@
 import { Context } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { JSONRPCMessageSchema } from "@modelcontextprotocol/sdk/types.js";
+import process from "node:process";
 import { SingleResponseTransport } from "../transport/mcp-transport.ts";
 import { registerAllTools } from "../tools/index.ts";
 import { createLogger } from "../utils/logger.ts";
@@ -33,15 +34,16 @@ export async function handleMcpPost(c: Context) {
   if (Array.isArray(body)) {
     return rpcError(c, 400, null, -32600, "JSON-RPC batches are not supported");
   }
-  const msg = body as Record<string, unknown> | null;
-  if (
-    typeof msg !== "object" || msg === null || msg.jsonrpc !== "2.0" ||
-    (msg.method !== undefined && typeof msg.method !== "string") ||
-    (msg.method === undefined && !("result" in msg || "error" in msg))
-  ) {
-    return rpcError(c, 400, msg?.id, -32600, "Invalid JSON-RPC message");
+  const idOf = (body as { id?: unknown } | null)?.id;
+  // The SDK's own schema decides what is a valid envelope; anything it would
+  // reject during dispatch must be refused here instead. A client-sent
+  // response (result or error, no method) is not a request or notification.
+  const parsed = JSONRPCMessageSchema.safeParse(body);
+  if (!parsed.success || !("method" in parsed.data)) {
+    return rpcError(c, 400, idOf, -32600, "Invalid JSON-RPC message");
   }
-  const message = msg as unknown as JSONRPCMessage;
+  const message = parsed.data;
+  const msg = { id: idOf };
 
   const server = new McpServer(
     { name: "google-tasks-mcp", version: "1.0.0" },
@@ -49,6 +51,14 @@ export async function handleMcpPost(c: Context) {
   );
   registerAllTools(server, mcpToken);
   const transport = new SingleResponseTransport();
+  server.server.onerror = (error) => transport.fail(error);
+  // Backstop for a handler that never answers; armed only while a request is
+  // in flight and cleared in finally, so it never holds an idle isolate awake.
+  const limitMs = Number(process.env.MCP_REQUEST_TIMEOUT_MS) || 25000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("MCP_TIMEOUT")), limitMs);
+  });
   try {
     await server.connect(transport);
 
@@ -60,7 +70,7 @@ export async function handleMcpPost(c: Context) {
     }
 
     transport.onmessage?.(message);
-    const reply = JSON.stringify(await transport.reply);
+    const reply = JSON.stringify(await Promise.race([transport.reply, timedOut]));
 
     // Streamable HTTP clients accept JSON; only fall back to a one-event SSE
     // body (finite, closes with the response) when JSON is not accepted.
@@ -74,8 +84,13 @@ export async function handleMcpPost(c: Context) {
     return c.body(reply, 200, { "Content-Type": "application/json" });
   } catch (error) {
     logger.error("MCP request failed", { error: String(error) });
+    if (String(error).includes("MCP_TIMEOUT")) {
+      return c.json({ jsonrpc: "2.0", id: idOf ?? null, error: { code: -32603, message: "Request timed out" } }, 504);
+    }
     return rpcError(c, 500, msg.id, -32603, "Internal error");
   } finally {
+    clearTimeout(timer);
+    timedOut.catch(() => {});
     server.close().catch(() => {});
   }
 }

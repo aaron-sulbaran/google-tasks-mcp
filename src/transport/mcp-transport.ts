@@ -7,7 +7,6 @@ import { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 export class SingleResponseTransport implements Transport {
   onmessage?: (message: JSONRPCMessage) => void;
   onclose?: () => void;
-  private sdkOnError?: (error: Error) => void;
   private resolveReply!: (message: JSONRPCMessage) => void;
   private rejectReply!: (error: Error) => void;
   readonly reply = new Promise<JSONRPCMessage>((resolve, reject) => {
@@ -19,16 +18,11 @@ export class SingleResponseTransport implements Transport {
     this.reply.catch(() => {}); // notifications never await the reply
   }
 
-  // The SDK reports protocol errors here. Route them to the reply so a POST
-  // always ends (no later reply can arrive once an error is reported).
-  set onerror(handler: ((error: Error) => void) | undefined) {
-    this.sdkOnError = handler;
-  }
-  get onerror(): (error: Error) => void {
-    return (error) => {
-      this.rejectReply(error);
-      this.sdkOnError?.(error);
-    };
+  onerror?: (error: Error) => void;
+
+  // Ends the pending reply with a failure (called from the server's onerror).
+  fail(error: Error): void {
+    this.rejectReply(error);
   }
 
   start(): Promise<void> {

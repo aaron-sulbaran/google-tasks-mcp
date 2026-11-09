@@ -1,9 +1,16 @@
 // Run: ENCRYPTION_SECRET=<32+ chars> deno test --allow-env --allow-read --allow-ffi --deny-net test/
 // Timers are intercepted before the app is imported so startup is covered too.
 const armed: string[] = [];
+const pendingTimeouts = new Set<unknown>();
 const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
 const realSetInterval = globalThis.setInterval;
-globalThis.setTimeout = ((...a: unknown[]) => (armed.push("timeout"), (realSetTimeout as any)(...a))) as any;
+globalThis.setTimeout = ((...a: unknown[]) => {
+  const id = (realSetTimeout as any)(...a);
+  pendingTimeouts.add(id);
+  return id;
+}) as any;
+globalThis.clearTimeout = ((id: unknown) => (pendingTimeouts.delete(id), (realClearTimeout as any)(id))) as any;
 globalThis.setInterval = ((...a: unknown[]) => (armed.push("interval"), (realSetInterval as any)(...a))) as any;
 
 const { createApp } = await import("../src/server/app.ts");
@@ -22,7 +29,8 @@ const users: Record<string, { googleAccessToken: string; googleRefreshToken: str
 const app = createApp({
   oauthConfig: { clientId: "x", clientSecret: "y", redirectUri: "http://localhost/cb" },
 });
-const STARTUP_TIMERS = armed.length;
+const STARTUP_TIMERS = armed.length + pendingTimeouts.size;
+Deno.env.set("MCP_REQUEST_TIMEOUT_MS", "300");
 
 const H = (token: string, accept = "application/json, text/event-stream") => ({
   Authorization: `Bearer ${token}`,
@@ -152,8 +160,7 @@ Deno.test("batch gets 400", async () => {
 
 Deno.test("SDK onerror and close end the reply instead of hanging", async () => {
   const a = new SingleResponseTransport();
-  a.onerror = () => {};
-  a.onerror(new Error("boom"));
+  a.fail(new Error("boom"));
   let failed = false;
   await a.reply.catch(() => (failed = true));
   assert(failed, "onerror did not reject");
@@ -165,9 +172,57 @@ Deno.test("SDK onerror and close end the reply instead of hanging", async () => 
   assert(failed, "close did not reject");
 });
 
-Deno.test("no timers armed at startup or during requests", async () => {
+Deno.test("invalid envelopes get 400 promptly (real SDK schema)", async () => {
+  const bad = [
+    { jsonrpc: "2.0", id: null, method: "tools/list" },
+    { jsonrpc: "2.0", id: 1, method: "tools/list", params: [] },
+    { jsonrpc: "2.0", id: 1, method: "tools/list", extra: true },
+    { jsonrpc: "2.0", id: 1, result: {} },
+    { jsonrpc: "2.0", result: 42 },
+    { jsonrpc: "2.0", id: 1, error: { code: 1, message: "m" } },
+  ];
+  for (const body of bad) {
+    const res = await Promise.race([
+      post(body),
+      new Promise<Response>((_, rej) => realSetTimeout(() => rej(new Error("hang")), 2000)),
+    ]);
+    assert(res.status === 400, `${JSON.stringify(body)} gave ${res.status}`);
+    await res.text();
+  }
+});
+
+Deno.test("SDK error after a real connect fails the reply without recursion", async () => {
+  const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
+  const server = new McpServer({ name: "t", version: "0" }, { capabilities: { tools: {} } });
+  const transport = new SingleResponseTransport();
+  server.server.onerror = (e: Error) => transport.fail(e);
+  await server.connect(transport);
+  transport.onerror?.(new Error("probe")); // SDK wrapper: no stack overflow
+  let failed = false;
+  await transport.reply.catch(() => (failed = true));
+  assert(failed, "reply not rejected");
+  await server.close();
+});
+
+Deno.test("a stalled handler gets 504 at the bound and leaves no timer", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (() => new Promise(() => {})) as any;
+  try {
+    const started = Date.now();
+    const res = await post(call(11));
+    assert(res.status === 504, `status ${res.status}`);
+    assert((await res.json()).error.code === -32603, "bad envelope");
+    assert(Date.now() - started < 3000, "too slow");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert(pendingTimeouts.size === 0, "timer left behind");
+});
+
+Deno.test("no interval ever, no timer pending after requests, none at startup", async () => {
   await post({ jsonrpc: "2.0", id: 5, method: "tools/list" });
   await post({ jsonrpc: "2.0", method: "notifications/initialized" });
   assert(STARTUP_TIMERS === 0, `startup armed ${STARTUP_TIMERS}`);
-  assert(armed.length === 0, `timers armed: ${armed.join(",")}`);
+  assert(armed.length === 0, `intervals armed: ${armed.join(",")}`);
+  assert(pendingTimeouts.size === 0, "timer pending after requests");
 });
