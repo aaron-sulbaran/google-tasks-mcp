@@ -14,7 +14,7 @@ Google Tasks MCP Server — an open-source Model Context Protocol server that le
 - **Run**: `deno task dev` (runs compiled `build/index.js`)
 - **Generate encryption secret**: `npm run generate-secret`
 
-No test framework is configured.
+Tests: `ENCRYPTION_SECRET=<32+ chars> deno test --allow-env --allow-read --allow-ffi --deny-net test/` (fakes only, no network).
 
 ## Architecture
 
@@ -28,7 +28,7 @@ No test framework is configured.
 Client → Hono HTTP (app.ts) → Security headers middleware → CORS middleware
   ├── OAuth routes (/register, /authorize, /callback, /token) → oauth.ts
   ├── MCP routes (/mcp GET/POST) → Bearer auth middleware → mcp-endpoints.ts
-  │     └── Creates McpServer + HonoSSETransport per session
+  │     └── GET answers 405; POST builds a stateless McpServer + SingleResponseTransport and answers in one response
   │           └── Registered tools (tools/*.ts) → google/api.ts → Google Tasks API
   └── Static routes (/, /health, /privacy-policy, /favicon.ico)
 ```
@@ -36,8 +36,8 @@ Client → Hono HTTP (app.ts) → Security headers middleware → CORS middlewar
 ### Key Modules
 
 - **`src/server/app.ts`** — Hono routes and security middleware. Route-specific CSP headers override the default restrictive CSP (the middleware checks `c.res.headers` before setting defaults).
-- **`src/server/mcp-endpoints.ts`** — GET creates SSE stream + MCP session; POST either creates a new session or routes messages to existing ones. Sessions use `TransformStream` for SSE output with 15s heartbeat pings.
-- **`src/transport/mcp-transport.ts`** — Custom `HonoSSETransport` implementing MCP's `Transport` interface. `SessionManager` tracks sessions with 30-minute timeout and periodic cleanup.
+- **`src/server/mcp-endpoints.ts`** — GET answers 405 (no server-to-client stream); POST is stateless and answers in one JSON response (202 for notifications). No timers or sessions, so the isolate can sleep.
+- **`src/transport/mcp-transport.ts`** — `SingleResponseTransport` captures the one reply per POST.
 - **`src/auth/oauth.ts`** — Full OAuth 2.0 with PKCE. Three-legged flow: client registers → redirects to Google → callback exchanges code → returns MCP bearer token (UUID). `OAuthStore` uses Deno KV with TTLs.
 - **`src/auth/token-store.ts`** — Encrypts Google tokens (AES-256-GCM) before storing in Deno KV. 30-day TTL.
 - **`src/google/api.ts`** — Thin wrapper over Google Tasks REST API. All calls go through `makeGoogleRequest()` which handles auth token refresh automatically (60s expiry threshold). Functions return promises directly (not async).
